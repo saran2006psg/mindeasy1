@@ -1,34 +1,38 @@
 // Libraries
 #include <driver/i2s.h>
+#include <driver/adc.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include "AudioFileSourceHTTPStream.h"
+#include "AudioGeneratorMP3.h"
+#include "AudioOutputI2S.h"
 #include "config.h"
 
-// INMP441 Ports
-#define I2S_WS 5   // LRC
-#define I2S_SD 19  // DOUT
-#define I2S_SCK 18 // BCLK
+// MAX4466 Microphone (Analog Input - ADC)
+#define ADC_MIC_PIN GPIO_NUM_34         // GPIO 34 for analog input (ADC)
+#define ADC_ATTENUATION ADC_ATTEN_DB_12 // ADC attenuation for 0-3.6V range (was ADC_ATTEN_DB_11)
+#define ADC_RESOLUTION ADC_WIDTH_BIT_12
+#define ADC_CHANNEL ADC1_CHANNEL_6 // GPIO 34 maps to ADC1_CHANNEL_6
 
-// MAX98357A Ports
+// MAX98357A Ports (I2S Output - Speaker)
 #define I2S_DOUT 22 // DIN
-#define I2S_BCLK 15 // BCLK
-#define I2S_LRC 21  // LRC
+#define I2S_BCLK 26 // BCLK
+#define I2S_LRC 25  // LRC
 
-// Wake-up Button
-#define Button_Pin GPIO_NUM_4
-
-// LED Ports
-#define isWifiConnectedPin 25
-#define isAudioRecording 32
-#define LED 2 
+// No button or LED components in this version
+// Use Serial commands to trigger recording
 
 // AP Mode Configuration
-#define AP_SSID "MideEase_Config"
+#define AP_SSID "Le"
 #define AP_PASSWORD "12345678"
 #define AP_CONFIG_TIMEOUT 300000 // 5 minutes timeout for configuration
+
+// Server URL Selection - Choose which backend to use
+// Set to 1 for LOCAL_IP (same WiFi network) or 0 for NGROK (remote access)
+#define USE_LOCAL_SERVER 1 // Change to 0 to use ngrok instead
 
 // DNS and webserver for captive portal
 const byte DNS_PORT = 53;
@@ -42,23 +46,27 @@ String configPassword = "";
 String configServerIP = "";
 bool configComplete = false;
 
-unsigned long lastButtonPressTime = 0;
-const unsigned long debounceTime = 500; // 500ms debounce
 volatile bool workflowInProgress = false;
 
 // MAX98357A I2S Setup
 #define MAX_I2S_NUM I2S_NUM_1
 #define MAX_I2S_SAMPLE_BITS (16)
 #define MAX_I2S_READ_LEN (256)
-#define MAX_I2S_SAMPLE_RATE (16000) // Changed from 12000 to match recording rate
-// INMP441 I2S Setup
-#define I2S_PORT I2S_NUM_0
-#define I2S_SAMPLE_RATE (16000)
-#define I2S_SAMPLE_BITS (16)
-#define I2S_READ_LEN (16 * 1024)
+#define MAX_I2S_SAMPLE_RATE (16000)
+
+// ADC Microphone Setup
+#define ADC_SAMPLE_RATE (16000)
+#define ADC_SAMPLE_BITS (16)
+#define ADC_READ_LEN (1024)
 #define RECORD_TIME (5) // Seconds
-#define I2S_CHANNEL_NUM (1)
-#define FLASH_RECORD_SIZE (I2S_CHANNEL_NUM * I2S_SAMPLE_RATE * I2S_SAMPLE_BITS / 8 * RECORD_TIME)
+#define ADC_CHANNEL_NUM (1)
+#define FLASH_RECORD_SIZE (ADC_CHANNEL_NUM * ADC_SAMPLE_RATE * ADC_SAMPLE_BITS / 8 * RECORD_TIME)
+
+// Microphone processing tuning for a cleaner, passable voice capture.
+#define MIC_ADC_CENTER (2048)
+#define MIC_DC_SMOOTH_SHIFT (6) // 1/64 smoothing for DC offset tracking
+#define MIC_NOISE_GATE_ADC (24) // Ignore very low-level background hiss
+#define MIC_GAIN_X10 (18)       // 1.8x digital gain
 
 File file;
 const char audioRecordfile[] = "/recording.wav";
@@ -67,7 +75,6 @@ const int headerSize = 44;
 unsigned long startMicros;
 
 bool isWIFIConnected = false;
-volatile bool buttonPressed = false;
 
 // Dynamic server URLs that will be updated based on configuration
 String serverUploadUrl;
@@ -77,17 +84,18 @@ String broadcastPermitionUrl;
 // Function prototypes
 void SPIFFSInit();
 void listSPIFFS(void);
-void i2sInitINMP441();
+void adcInitMicrophone();
 void i2sInitMax98357A();
 void wavHeader(byte *header, int wavSize);
-void I2SAudioRecord_dataScale(uint8_t *d_buff, uint8_t *s_buff, uint32_t len);
+void ADCDataScale(uint16_t *d_buff, uint16_t adc_raw);
 void printSpaceInfo();
 bool connectToWifi();
-void buttonInterrupt();
 void handleVoiceAssistantWorkflow();
 void recordAudio();
-void uploadFile();
+bool uploadFile(); // Returns true if successful
 void waitForResponseAndPlay();
+void testSpeaker();
+void testMp3Playback();
 void startConfigPortal();
 void handleRoot();
 void handleSave();
@@ -100,24 +108,21 @@ void setup()
   Serial.begin(115200);
   delay(500);
 
-  // Set up LEDs
-  pinMode(isWifiConnectedPin, OUTPUT);
-  digitalWrite(isWifiConnectedPin, LOW);
-  pinMode(isAudioRecording, OUTPUT);
-  digitalWrite(isAudioRecording, LOW);
-  pinMode(LED,OUTPUT);
-  digitalWrite(LED, LOW);
-
-
-  // Set up button with interrupt
-  pinMode(Button_Pin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(Button_Pin), buttonInterrupt, FALLING);
+  Serial.println("\n========================================");
+  Serial.println("  🎙️ MindEase Voice Assistant");
+  Serial.println("========================================");
+  Serial.println("Commands:");
+  Serial.println("  'start' or 's' - Start voice recording");
+  Serial.println("  'test' or 't' - Play test speaker beep");
+  Serial.println("  'test_mp3' - Stream and play a sample MP3 song");
+  Serial.println("  'status' - Check WiFi status");
+  Serial.println("========================================\n");
 
   // Initialize SPIFFS
   SPIFFSInit();
 
-  // Initialize I2S interfaces
-  i2sInitINMP441();
+  // Initialize ADC for MAX4466 microphone and I2S for MAX98357A speaker
+  adcInitMicrophone();
   i2sInitMax98357A();
 
   // First try to connect using hardcoded credentials
@@ -146,21 +151,45 @@ void setup()
   // Update server URLs with the static URL
   updateServerUrls();
 
-  Serial.println("Setup complete. Press button to start voice assistant.");
+  Serial.println("\n✅ Setup complete!");
+  Serial.println("Type 'start' or 's' in Serial Monitor to begin recording.");
 }
 
 void updateServerUrls()
 {
-  // Use static URL instead of IP address
-  String baseUrl = "http://hornet-upright-ewe.ngrok-free.app";
+  String baseUrl;
+
+#if USE_LOCAL_SERVER
+  // ============================================================
+  // Option 1: LOCAL IP (Recommended for same WiFi testing)
+  // - Faster response time
+  // - No dependency on ngrok tunnel
+  // - Works only on same WiFi network (10.111.206.74)
+  // ============================================================
+  baseUrl = "http://10.111.206.74:3000";
+  Serial.println("\n✅ Using LOCAL SERVER IP (same WiFi)");
+#else
+  // ============================================================
+  // Option 2: NGROK URL (For remote access from anywhere)
+  // - Can access from any network
+  // - Public internet access
+  // - May have slight latency
+  // - Free tier may expire after 2 hours
+  // ============================================================
+  baseUrl = "https://perceptibly-preceremonial-madison.ngrok-free.dev";
+  Serial.println("\n📡 Using NGROK TUNNEL (remote access)");
+#endif
+
   serverUploadUrl = baseUrl + "/uploadAudio";
   serverBroadcastUrl = baseUrl + "/broadcastAudio";
   broadcastPermitionUrl = baseUrl + "/checkVariable";
 
-  Serial.println("Server URLs updated:");
+  Serial.println("\nServer URLs updated:");
+  Serial.println("Base URL: " + baseUrl);
   Serial.println("Upload URL: " + serverUploadUrl);
   Serial.println("Broadcast URL: " + serverBroadcastUrl);
   Serial.println("Permission URL: " + broadcastPermitionUrl);
+  Serial.println("=" + String(50, '='));
 }
 
 void startConfigPortal()
@@ -187,15 +216,6 @@ void startConfigPortal()
   Serial.println("Connect to WiFi network: " + String(AP_SSID));
   Serial.println("Password: " + String(AP_PASSWORD));
   Serial.println("Then navigate to http://192.168.4.1 to configure");
-
-  // Blink LED to indicate config mode
-  for (int i = 0; i < 5; i++)
-  {
-    digitalWrite(isWifiConnectedPin, HIGH);
-    delay(100);
-    digitalWrite(isWifiConnectedPin, LOW);
-    delay(100);
-  }
 
   // Wait for configuration or timeout
   unsigned long startTime = millis();
@@ -352,32 +372,57 @@ void loop()
   {
     Serial.println("WiFi connection lost. Reconnecting...");
     isWIFIConnected = connectToWifi();
-    if (!isWIFIConnected)
+  }
+
+  // Check for Serial commands
+  if (Serial.available() > 0 && !workflowInProgress)
+  {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toLowerCase();
+
+    if (command == "start" || command == "s")
     {
-      digitalWrite(isWifiConnectedPin, LOW);
+      Serial.println("\n🎤 Starting voice assistant workflow...\n");
+      workflowInProgress = true;
+      handleVoiceAssistantWorkflow();
+      workflowInProgress = false;
+      Serial.println("\n✅ Ready for next command. Type 'start' or 's' to begin.");
+    }
+    else if (command == "test" || command == "t")
+    {
+      Serial.println("\n🔊 Testing speaker...\n");
+      testSpeaker();
+      Serial.println("\n✅ Test complete. Type 'test' to try again.");
+    }
+    else if (command == "test_mp3")
+    {
+      Serial.println("\n🎵 Testing MP3 Playback...");
+      testMp3Playback();
+      Serial.println("\n✅ MP3 Test complete.");
+    }
+    else if (command == "status")
+    {
+      Serial.println("\n📊 Status:");
+      Serial.print("WiFi: ");
+      Serial.println(isWIFIConnected ? "Connected" : "Disconnected");
+      if (isWIFIConnected)
+      {
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+        Serial.print("Signal: ");
+        Serial.print(WiFi.RSSI());
+        Serial.println(" dBm");
+      }
+      Serial.println();
+    }
+    else if (command.length() > 0)
+    {
+      Serial.println("❌ Unknown command. Use 'start', 's', 'test', 't', 'test_mp3', or 'status'");
     }
   }
 
-  if (buttonPressed && !workflowInProgress)
-  {
-    buttonPressed = false;
-    workflowInProgress = true;
-    handleVoiceAssistantWorkflow();
-    workflowInProgress = false;
-    // Add a delay after completing workflow to prevent immediate restart
-    delay(1000);
-  }
   delay(100);
-}
-
-void IRAM_ATTR buttonInterrupt()
-{
-  unsigned long currentTime = millis();
-  if (currentTime - lastButtonPressTime > debounceTime && !workflowInProgress)
-  {
-    buttonPressed = true;
-    lastButtonPressTime = currentTime;
-  }
 }
 
 bool connectToWifi()
@@ -415,7 +460,6 @@ bool connectToWifi()
 
   if (WiFi.status() == WL_CONNECTED)
   {
-    digitalWrite(isWifiConnectedPin, HIGH);
     Serial.println("\nConnected to WiFi!");
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
@@ -423,7 +467,6 @@ bool connectToWifi()
   }
   else
   {
-    digitalWrite(isWifiConnectedPin, LOW);
     Serial.println("\nFailed to connect to WiFi!");
     Serial.println("SSID: " + (configComplete ? configSSID : String(WIFI_SSID)));
     Serial.println("Status code: " + String(WiFi.status()));
@@ -485,14 +528,12 @@ void handleVoiceAssistantWorkflow()
 
   // Record audio
   unsigned long t1 = millis();
-  digitalWrite(LED, HIGH);
   recordAudio();
   Serial.printf("Time taken for recording: %lu ms\n", millis() - t1);
 
   // Upload to server
-  
   t1 = millis();
-  uploadFile();
+  bool uploadSuccess = uploadFile();
   Serial.printf("Time taken for upload: %lu ms\n", millis() - t1);
 
   // Clean up recording file to save space
@@ -501,10 +542,18 @@ void handleVoiceAssistantWorkflow()
     SPIFFS.remove(audioRecordfile);
   }
 
-  // Wait for response and play it
-  t1 = millis();
-  waitForResponseAndPlay();
-  Serial.printf("Time taken for wait + playback: %lu ms\n", millis() - t1);
+  // Only wait for and play response if upload was successful
+  if (uploadSuccess)
+  {
+    t1 = millis();
+    waitForResponseAndPlay();
+    Serial.printf("Time taken for wait + playback: %lu ms\n", millis() - t1);
+  }
+  else
+  {
+    Serial.println("❌ Skipping response playback due to upload failure");
+  }
+
   Serial.printf("Total workflow time: %lu ms\n", millis() - totalStart);
 
   // Clean up response file
@@ -512,51 +561,73 @@ void handleVoiceAssistantWorkflow()
   {
     SPIFFS.remove(audioResponsefile);
   }
-  digitalWrite(LED, LOW);
-  Serial.println("Workflow completed. Ready for next button press.");
+  Serial.println("Workflow completed. Ready for next command.");
 }
 
 void recordAudio()
 {
-  digitalWrite(isAudioRecording, HIGH);
   Serial.println(" *** Get Ready to Speak *** ");
 
-  // Initialize buffer for flushing
-  int i2s_read_len = I2S_READ_LEN;
-  size_t bytes_read;
-  char *flush_buff = (char *)calloc(i2s_read_len, sizeof(char));
-
-  // Flush the I2S buffer multiple times to clear any previous audio
-  for (int i = 0; i < 5; i++)
-  {
-    i2s_read(I2S_PORT, (void *)flush_buff, i2s_read_len, &bytes_read, portMAX_DELAY);
-  }
-  free(flush_buff);
-
-  // Add a short delay before starting
-  delay(500);
+  delay(500); // Small delay before starting
 
   Serial.println(" *** Recording Start *** ");
 
   int flash_wr_size = 0;
-  char *i2s_read_buff = (char *)calloc(i2s_read_len, sizeof(char));
-  uint8_t *flash_write_buff = (uint8_t *)calloc(i2s_read_len, sizeof(char));
-
-  digitalWrite(isAudioRecording, HIGH);
+  int32_t dcEstimate = MIC_ADC_CENTER;
+  uint16_t *adc_buff = (uint16_t *)calloc(ADC_READ_LEN, sizeof(uint16_t));
+  uint8_t *flash_write_buff = (uint8_t *)calloc(ADC_READ_LEN * 2, sizeof(uint8_t));
 
   while (flash_wr_size < FLASH_RECORD_SIZE)
   {
-    i2s_read(I2S_PORT, (void *)i2s_read_buff, i2s_read_len, &bytes_read, portMAX_DELAY);
-    I2SAudioRecord_dataScale(flash_write_buff, (uint8_t *)i2s_read_buff, i2s_read_len);
-    file.write((const byte *)flash_write_buff, i2s_read_len);
-    flash_wr_size += i2s_read_len;
+    // Read ADC samples
+    for (int i = 0; i < ADC_READ_LEN; i++)
+    {
+      adc_buff[i] = adc1_get_raw(ADC_CHANNEL);
+    }
+
+    // Convert ADC raw values to 16-bit audio and write to buffer
+    for (int i = 0; i < ADC_READ_LEN; i++)
+    {
+      // Track and remove slow DC drift, then apply a soft noise gate + gain.
+      int32_t raw = adc_buff[i];
+      dcEstimate += (raw - dcEstimate) >> MIC_DC_SMOOTH_SHIFT;
+
+      int32_t centered = raw - dcEstimate;
+      if (centered < MIC_NOISE_GATE_ADC && centered > -MIC_NOISE_GATE_ADC)
+      {
+        centered = 0;
+      }
+
+      int32_t amplified = (centered * MIC_GAIN_X10) / 10;
+      int32_t sample32 = amplified << 4;
+
+      if (sample32 > 32767)
+      {
+        sample32 = 32767;
+      }
+      else if (sample32 < -32768)
+      {
+        sample32 = -32768;
+      }
+
+      int16_t audio_sample = (int16_t)sample32;
+      flash_write_buff[i * 2] = audio_sample & 0xFF;
+      flash_write_buff[i * 2 + 1] = (audio_sample >> 8) & 0xFF;
+    }
+
+    // Write to file
+    file.write(flash_write_buff, ADC_READ_LEN * 2);
+    flash_wr_size += ADC_READ_LEN * 2;
+
     Serial.printf("Sound recording %u%%\n", flash_wr_size * 100 / FLASH_RECORD_SIZE);
+
+    // Small delay to avoid overwhelming the ADC
+    delay(1);
   }
 
   file.close();
-  digitalWrite(isAudioRecording, LOW);
 
-  free(i2s_read_buff);
+  free(adc_buff);
   free(flash_write_buff);
 
   Serial.println("Recording completed");
@@ -564,185 +635,381 @@ void recordAudio()
   startMicros = micros(); // Start time
 }
 
-void uploadFile()
+bool uploadFile()
 {
   file = SPIFFS.open(audioRecordfile, FILE_READ);
   if (!file)
   {
     Serial.println("FILE IS NOT AVAILABLE!");
-    return;
+    return false;
   }
 
   Serial.println("===> Upload FILE to Node.js Server");
   Serial.printf("Free heap before upload: %u bytes\n", ESP.getFreeHeap());
 
-
   HTTPClient client;
   client.begin(serverUploadUrl);
   client.addHeader("Content-Type", "audio/wav");
-  client.setTimeout(10000); // <-- wait up to 60 seconds
+  client.setTimeout(60000); // Wait up to 60 seconds for upload
   // client.setReuse(true);              // optional: reuse the TCP connection
-  delay(500);  // Give ESP some breathing time
-  yield();     // Yield to WiFi task scheduler
+  delay(500); // Give ESP some breathing time
+  yield();    // Yield to WiFi task scheduler
   int httpResponseCode = client.sendRequest("POST", &file, file.size());
 
   Serial.print("httpResponseCode : ");
   Serial.println(httpResponseCode);
 
+  bool success = false;
   if (httpResponseCode == 200)
   {
     String response = client.getString();
     Serial.println("==================== Transcription ====================");
     Serial.println(response);
     Serial.println("====================      End      ====================");
+    success = true;
   }
-  else {
+  else
+  {
     Serial.printf("Upload failed, error code: %d\n", httpResponseCode);
-    if (httpResponseCode == -11) {
+    if (httpResponseCode == -11)
+    {
       Serial.println("Likely memory or timeout issue. Try increasing timeout or reducing file size.");
     }
+    else if (httpResponseCode == -3)
+    {
+      Serial.println("Error -3: Connection failed. Check WiFi and server availability.");
+    }
+    success = false;
   }
 
   file.close();
   client.end();
+  return success;
 }
 
-void waitForResponseAndPlay() {
-  HTTPClient http;
-  int maxAttempts = 30;
+void waitForResponseAndPlay()
+{
+  int maxAttempts = 120; // Increased from 30 to 120 (60 seconds with 500ms delay)
   bool responseReady = false;
 
   Serial.println("Waiting for server processing...");
 
-  for (int i = 0; i < maxAttempts; i++) {
+  for (int i = 0; i < maxAttempts; i++)
+  {
+    HTTPClient http; // Create fresh for each request
     http.begin(broadcastPermitionUrl);
+    http.setTimeout(3000); // Set timeout for this request
     int httpResponseCode = http.GET();
 
-    if (httpResponseCode > 0) {
+    if (httpResponseCode == 200)
+    {
       String payload = http.getString();
-      if (payload.indexOf("\"ready\":true") > -1) {
+      http.end();
+      if (payload.indexOf("\"ready\":true") > -1)
+      {
         responseReady = true;
         break;
       }
     }
+    else if (httpResponseCode < 0)
+    {
+      Serial.printf("Check request error: %d. Retrying... (%d/%d)\n", httpResponseCode, i + 1, maxAttempts);
+    }
+
     http.end();
     delay(500);
   }
 
-  if (!responseReady) {
-    Serial.println("Server response timeout");
+  if (!responseReady)
+  {
+    Serial.println("❌ Server response timeout - LLM processing took too long");
     return;
   }
 
-  Serial.println("Playing response...");
-  http.begin(serverBroadcastUrl);
-  int httpCode = http.GET();
+  Serial.println("✓ Server response ready. Playing audio...");
 
-  if (httpCode == HTTP_CODE_OK) {
-    i2s_zero_dma_buffer(MAX_I2S_NUM);
+  // Create a fresh HTTP connection for audio download
+  HTTPClient audioHttp;
+  audioHttp.begin(serverBroadcastUrl);
+  audioHttp.setTimeout(30000); // 30 second timeout for audio download
+  int httpCode = audioHttp.GET();
 
-    WiFiClient *stream = http.getStreamPtr();
-    size_t contentLength = http.getSize();  // Actual content size
-
-    // Skip WAV header
-    uint8_t header_buffer[44];
-    int header_bytes_read = 0;
-    while (header_bytes_read < 44) {
-      int len = stream->read(header_buffer + header_bytes_read, 44 - header_bytes_read);
-      if (len > 0) header_bytes_read += len;
-    }
-
-    uint8_t buffer[4096];
-    size_t total_bytes_written = 0;
-
-    while (total_bytes_written < contentLength - 44) {
-      int len = stream->read(buffer, sizeof(buffer));
-      if (len > 0) {
-        size_t written;
-        i2s_write(MAX_I2S_NUM, buffer, len, &written, portMAX_DELAY);
-        total_bytes_written += written;
-      } else {
-        delay(10); // small wait for more data
-      }
-    }
-
-    delay(500); // Let audio complete
-    i2s_stop(MAX_I2S_NUM);
-    i2s_zero_dma_buffer(MAX_I2S_NUM);
-    i2s_start(MAX_I2S_NUM);
-    Serial.printf("Audio playback completed (bytes: %d)\n", total_bytes_written);
-  } else {
-    Serial.printf("HTTP GET failed, error: %s\n", http.errorToString(httpCode).c_str());
+  if (httpCode != 200)
+  {
+    Serial.printf("❌ Failed to get audio, error code: %d\n", httpCode);
+    audioHttp.end();
+    return;
   }
 
-  // Important: manually close the stream to prevent hanging
-  http.getStreamPtr()->stop();
-  http.end();
+  WiFiClient *stream = audioHttp.getStreamPtr();
+
+  // Validate stream is not null
+  if (stream == nullptr)
+  {
+    Serial.println("❌ Error: Stream pointer is null");
+    audioHttp.end();
+    return;
+  }
+
+  size_t contentLength = audioHttp.getSize();
+
+  // Validate content length
+  if (contentLength <= 44)
+  {
+    Serial.println("❌ Error: Audio file too small or empty (size: " + String(contentLength) + " bytes)");
+    audioHttp.end();
+    return;
+  }
+
+  Serial.printf("Audio file size: %d bytes\n", contentLength);
+
+  // Skip WAV header
+  uint8_t header_buffer[44];
+  int header_bytes_read = 0;
+  int attempts = 0;
+  while (header_bytes_read < 44 && attempts < 100)
+  {
+    int len = stream->read(header_buffer + header_bytes_read, 44 - header_bytes_read);
+    if (len > 0)
+      header_bytes_read += len;
+    else
+    {
+      delay(10);
+      attempts++;
+    }
+  }
+
+  if (header_bytes_read < 44)
+  {
+    Serial.println("❌ Error: Could not read WAV header");
+    audioHttp.end();
+    return;
+  }
+
+  // Debug: Print WAV header info
+  Serial.println("\n📊 WAV Header Analysis:");
+  Serial.printf("  RIFF Marker: %c%c%c%c\n", header_buffer[0], header_buffer[1], header_buffer[2], header_buffer[3]);
+  Serial.printf("  WAVE Marker: %c%c%c%c\n", header_buffer[8], header_buffer[9], header_buffer[10], header_buffer[11]);
+
+  uint16_t channels = header_buffer[22] | (header_buffer[23] << 8);
+  uint32_t sampleRate = header_buffer[24] | (header_buffer[25] << 8) | (header_buffer[26] << 16) | (header_buffer[27] << 24);
+  uint16_t bitsPerSample = header_buffer[34] | (header_buffer[35] << 8);
+
+  Serial.printf("  Channels: %d\n", channels);
+  Serial.printf("  Sample Rate: %u Hz\n", sampleRate);
+  Serial.printf("  Bits per Sample: %d\n", bitsPerSample);
+  Serial.printf("  Expected Duration: %.2f seconds\n", (float)(contentLength - 44) / (sampleRate * channels * bitsPerSample / 8));
+  Serial.println();
+
+  uint8_t buffer[512];        // Smaller read buffer
+  int16_t stereo_buffer[512]; // Smaller stereo buffer
+  size_t total_bytes_written = 0;
+  int no_data_count = 0;
+  uint8_t leftover_byte = 0;
+  bool has_leftover = false;
+
+  i2s_zero_dma_buffer(MAX_I2S_NUM);
+
+  while (total_bytes_written < contentLength - 44)
+  {
+    // If we have a leftover byte, read one less
+    int max_to_read = sizeof(buffer) - (has_leftover ? 1 : 0);
+    // Don't read past the end of the file
+    size_t remaining = (contentLength - 44) - total_bytes_written;
+    if (max_to_read > remaining)
+      max_to_read = remaining;
+
+    int len = stream->read(buffer + (has_leftover ? 1 : 0), max_to_read);
+
+    if (len > 0)
+    {
+      no_data_count = 0;
+
+      int total_len = len + (has_leftover ? 1 : 0);
+      int num_samples = total_len / 2;
+
+      has_leftover = (total_len % 2 != 0);
+      if (has_leftover)
+      {
+        leftover_byte = buffer[total_len - 1]; // Save the odd byte
+      }
+
+      // Convert mono 16-bit samples to stereo
+      for (int i = 0; i < num_samples; i++)
+      {
+        int16_t mono_sample = ((int16_t *)buffer)[i];
+        stereo_buffer[i * 2] = mono_sample;     // Left
+        stereo_buffer[i * 2 + 1] = mono_sample; // Right
+      }
+
+      // Move leftover byte to front for next iteration
+      if (has_leftover)
+      {
+        buffer[0] = leftover_byte;
+      }
+
+      size_t written;
+      i2s_write(MAX_I2S_NUM, stereo_buffer, num_samples * 4, &written, portMAX_DELAY);
+      // We read `len` bytes from the stream
+      total_bytes_written += len;
+    }
+    else
+    {
+      no_data_count++;
+      if (no_data_count > 100) // 1 second timeout (100 * 10ms)
+      {
+        Serial.println("⚠️  Warning: Stream timeout during playback");
+        break;
+      }
+      delay(10); // small wait for more data
+    }
+  }
+
+  delay(500); // Let audio complete
+  i2s_stop(MAX_I2S_NUM);
+  i2s_zero_dma_buffer(MAX_I2S_NUM);
+  i2s_start(MAX_I2S_NUM);
+  Serial.printf("✓ Audio playback completed (%d bytes played)\n", total_bytes_written);
+
+  audioHttp.end();
 }
 
-
-void i2sInitINMP441()
+void testSpeaker()
 {
-  i2s_config_t i2s_config = {
-      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-      .sample_rate = I2S_SAMPLE_RATE,
-      .bits_per_sample = i2s_bits_per_sample_t(I2S_SAMPLE_BITS),
-      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-      .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),
-      .intr_alloc_flags = 0,
-      .dma_buf_count = 64,
-      .dma_buf_len = 1024,
-      .use_apll = 1};
+  // Generate a simple 1000Hz test tone for 1 second
+  Serial.println("🔊 Testing speaker with 1000Hz tone...");
 
-  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  const int sample_rate = 16000;
+  const int duration_ms = 1000;
+  const int frequency = 1000; // 1000 Hz tone
+  const int amplitude = 8000; // Volume level (max 32767)
 
-  const i2s_pin_config_t pin_config = {
-      .bck_io_num = I2S_SCK,
-      .ws_io_num = I2S_WS,
-      .data_out_num = -1,
-      .data_in_num = I2S_SD};
+  int num_samples = (sample_rate * duration_ms) / 1000;
+  int16_t sample_buffer[512];
 
-  i2s_set_pin(I2S_PORT, &pin_config);
+  i2s_zero_dma_buffer(MAX_I2S_NUM);
+
+  for (int i = 0; i < num_samples; i += 256)
+  {
+    int samples_to_generate = min(256, num_samples - i);
+
+    for (int j = 0; j < samples_to_generate; j++)
+    {
+      // Generate sine wave
+      float t = (float)(i + j) / sample_rate;
+      float value = sin(2.0 * PI * frequency * t) * amplitude;
+      sample_buffer[j * 2] = (int16_t)value;     // Left channel
+      sample_buffer[j * 2 + 1] = (int16_t)value; // Right channel
+    }
+
+    size_t bytes_written;
+    i2s_write(MAX_I2S_NUM, sample_buffer, samples_to_generate * 4, &bytes_written, portMAX_DELAY);
+  }
+
+  delay(100);
+  i2s_zero_dma_buffer(MAX_I2S_NUM);
+  Serial.println("✅ Test tone complete. Did you hear a beep?");
 }
 
-void i2sInitMax98357A() {
+void testMp3Playback()
+{
+  Serial.println("Temporarily uninstalling I2S driver for MP3 playback...");
+  i2s_driver_uninstall(MAX_I2S_NUM);
+
+  AudioGeneratorMP3 *mp3 = new AudioGeneratorMP3();
+  AudioFileSourceHTTPStream *file = new AudioFileSourceHTTPStream("http://commondatastorage.googleapis.com/codeskulptor-demos/DDR_assets/Kangaroo_MusiQue_-_The_Neverwritten_Role_Playing_Game.mp3");
+  AudioOutputI2S *out = new AudioOutputI2S();
+
+  out->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  out->SetGain(0.5);
+
+  Serial.println("Starting MP3 playback from HTTP stream...");
+  mp3->begin(file, out);
+
+  while (mp3->isRunning())
+  {
+    if (!mp3->loop())
+    {
+      mp3->stop();
+      Serial.println("MP3 playback finished\n");
+    }
+  }
+
+  // Cleanup
+  delete mp3;
+  delete file;
+  delete out;
+
+  Serial.println("Re-initializing I2S for default functionality...");
+  i2sInitMax98357A();
+}
+
+void adcInitMicrophone()
+{
+  // Configure ADC for MAX4466 microphone
+  Serial.println("Initializing ADC for MAX4466 microphone...");
+
+  // Configure ADC1 for analog input
+  adc1_config_width(ADC_RESOLUTION);
+  adc1_config_channel_atten(ADC_CHANNEL, ADC_ATTENUATION);
+
+  // Disable the digital part of GPIO 34 to use it as ADC input
+  gpio_set_direction(ADC_MIC_PIN, GPIO_MODE_DISABLE);
+
+  Serial.println("ADC Microphone initialized successfully");
+  Serial.println("Configuration:");
+  Serial.println("  - Input PIN: GPIO 34 (ADC1_CHANNEL_6)");
+  Serial.println("  - Sample Rate: 16000 Hz");
+  Serial.println("  - Bit Depth: 16-bit");
+  Serial.println("  - Attenuation: 12dB (0-3.6V range)");
+}
+
+void i2sInitMax98357A()
+{
+  // Initialize I2S for MAX98357A speaker (I2S TX only)
+  Serial.println("Initializing I2S for MAX98357A speaker...");
+
   i2s_config_t i2s_config = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
       .sample_rate = MAX_I2S_SAMPLE_RATE,
       .bits_per_sample = i2s_bits_per_sample_t(MAX_I2S_SAMPLE_BITS),
-      .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
-      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-      .intr_alloc_flags = 0,
-      .dma_buf_count = 4,
-      .dma_buf_len = 1024,
+      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,                           // Stereo output
+      .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_STAND_I2S), // Standard I2S format
+      .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,                               // Use interrupt level 1
+      .dma_buf_count = 6,                                                     // 6 buffers for stable playback
+      .dma_buf_len = 256,                                                     // Smaller buffers for lower latency
       .use_apll = false,
       .tx_desc_auto_clear = true,
-      .fixed_mclk = 0
-  };
+      .fixed_mclk = 0};
 
   i2s_pin_config_t pin_config = {
-      .bck_io_num = I2S_BCLK,
-      .ws_io_num = I2S_LRC,
-      .data_out_num = I2S_DOUT,
-      .data_in_num = -1
-  };
+      .bck_io_num = I2S_BCLK,   // GPIO 26 - Bit clock
+      .ws_io_num = I2S_LRC,     // GPIO 25 - Word select (Left/Right clock)
+      .data_out_num = I2S_DOUT, // GPIO 22 - Data output
+      .data_in_num = -1};       // No input
 
   i2s_driver_install(MAX_I2S_NUM, &i2s_config, 0, NULL);
   i2s_set_pin(MAX_I2S_NUM, &pin_config);
   i2s_zero_dma_buffer(MAX_I2S_NUM);
+  i2s_start(MAX_I2S_NUM); // Start the I2S interface
+
+  Serial.println("✓ I2S Speaker initialized successfully");
+  Serial.println("Configuration:");
+  Serial.println("  - DIN (Data): GPIO 22");
+  Serial.println("  - BCLK (Bit Clock): GPIO 26");
+  Serial.println("  - LRC (Word Select): GPIO 25");
+  Serial.println("  - Sample Rate: 16000 Hz");
+  Serial.println("  - Bit Depth: 16-bit");
+  Serial.println("  - Format: Standard I2S");
+  Serial.println("  - DMA: 6 buffers x256 bytes");
 }
 
-void I2SAudioRecord_dataScale(uint8_t *d_buff, uint8_t *s_buff, uint32_t len)
+void ADCDataScale(uint16_t *d_buff, uint16_t adc_raw)
 {
-  uint32_t j = 0;
-  uint32_t dac_value = 0;
-  for (int i = 0; i < len; i += 2)
-  {
-    dac_value = ((((uint16_t)(s_buff[i + 1] & 0xf) << 8) | ((s_buff[i + 0]))));
-    d_buff[j++] = 0;
-    // Increase amplification factor from 256/2048 to improve volume
-    d_buff[j++] = dac_value * 512 / 2048; // Double the amplification
-  }
+  // Convert 12-bit ADC (0-4095) to 16-bit audio (-32768 to 32767)
+  // Subtract offset to center around 0, then shift to 16-bit range
+  int16_t audio_sample = (int16_t)((adc_raw - 2048) << 4);
+  d_buff[0] = (uint16_t)audio_sample;
 }
 
 void wavHeader(byte *header, int wavSize)
@@ -891,7 +1158,6 @@ bool tryHardcodedWifi()
 
   if (WiFi.status() == WL_CONNECTED)
   {
-    digitalWrite(isWifiConnectedPin, HIGH);
     Serial.println("\nConnected to WiFi!");
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());

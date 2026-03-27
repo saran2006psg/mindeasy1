@@ -2,122 +2,331 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const speech = require('@google-cloud/speech');
-const textToSpeech = require('@google-cloud/text-to-speech');
 const axios = require('axios');
+const groqAudioService = require('./services/groqAudioService'); // Switched from ElevenLabs to Groq
 require('dotenv').config();
 require('express-async-errors');
 
 const port = process.env.PORT || 3000;
-process.env.GOOGLE_APPLICATION_CREDENTIALS = path.resolve(process.env.GOOGLE_APPLICATION_CREDENTIALS);
-
-
-
-// Init express
 const app = express();
 
-
-// Path to files for production
 const recordFile = path.join(__dirname, 'tmp', 'recording.wav');
-const voicedFile = path.join(__dirname, 'tmp', 'voicedby.wav');
-
-// API Key
+const voicedMp3File = path.join(__dirname, 'public', 'response.mp3');
 const groqApiKey = process.env.GROQ_API_KEY;
+const ngrokUrl = process.env.NGROK_URL || '';
+
+const MENTAL_HEALTH_SYSTEM_PROMPT =
+  'You are MindEase, a compassionate and insightful mental health support companion. '
+  + 'Respond with warmth and genuine understanding to help users feel heard and supported. '
+  + 'Provide practical, actionable advice grounded in evidence-based wellness techniques. '
+  + 'Use calming language and encourage healthy coping strategies. '
+  + 'Avoid medical diagnosis, but always encourage professional help if there are signs of crisis. '
+  + 'Keep responses concise but meaningful, with a touch of human warmth.';
+
 let shouldDownloadFile = false;
+let journalEntries = [];
 
-// Init Google Cloud clients
-const speechClient = new speech.SpeechClient();
-const ttsClient = new textToSpeech.TextToSpeechClient();
-
-// Middleware for data processing
+app.use(cors());
 app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
-// Upload Audio
 app.post('/uploadAudio', async (req, res) => {
   try {
     shouldDownloadFile = false;
     const recordingFile = fs.createWriteStream(recordFile);
     let dataSize = 0;
+    let responseSent = false;
+    const startTime = Date.now();
 
     req.on('data', (chunk) => {
       dataSize += chunk.length;
     });
 
-    req.pipe(recordingFile);
-
-    req.on('end', async () => {
-      recordingFile.end();
-      console.log(`Audio upload complete. Total size: ${dataSize} bytes`);
-
-      try {
-        const transcription = await speechToTextAPI();
-        if (transcription) {
-          console.log("Transcription successful, calling Groq...");
-          res.status(200).send(transcription);
-          //calling the groq api 
-          callGroq(transcription);
-          // Uncomment the line below to call the custom LLM API instead of Groq
-          // callCustomLLM(transcription);
-        } else {
-          console.error("Transcription failed, sending error response");
-          res.status(200).send('Error transcribing audio');
-        }
-      } catch (err) {
-        console.error('Error in audio processing:', err);
-        res.status(200).send('Error processing audio');
+    req.on('error', (err) => {
+      if (!responseSent) {
+        responseSent = true;
+        console.error('Error receiving file:', err.message);
+        res.status(500).send('Error uploading audio');
       }
     });
 
-    req.on('error', (err) => {
-      console.error('Error writing file:', err);
-      res.status(500).send('Error uploading audio');
+    recordingFile.on('error', (err) => {
+      if (!responseSent) {
+        responseSent = true;
+        console.error('Error writing file:', err.message);
+        res.status(500).send('Error writing audio file');
+      }
     });
+
+    recordingFile.on('finish', async () => {
+      console.log(`Audio upload complete. Size: ${dataSize} bytes (${((Date.now() - startTime) / 1000).toFixed(2)}s)`);
+
+      try {
+        const transcription = await speechToTextAPI();
+
+        if (transcription) {
+          if (!responseSent) {
+            responseSent = true;
+            res.status(200).send(transcription);
+          }
+          await callGroqForEsp32(transcription);
+        } else {
+          if (!responseSent) {
+            responseSent = true;
+            res.status(200).send('Error transcribing audio');
+          }
+        }
+      } catch (err) {
+        console.error('Error in audio processing:', err.message);
+        if (!responseSent) {
+          responseSent = true;
+          res.status(200).send('Error processing audio');
+        }
+      }
+    });
+
+    req.pipe(recordingFile);
   } catch (error) {
-    console.error('Unexpected error:', error);
+    console.error('Unexpected error:', error.message);
     res.status(500).send('Unexpected server error');
   }
 });
 
-// Check Variable
 app.get('/checkVariable', (req, res) => {
   res.json({ ready: shouldDownloadFile });
 });
 
-// Broadcast Audio
 app.get('/broadcastAudio', (req, res) => {
-  fs.stat(voicedFile, (err, stats) => {
-    if (err) return res.sendStatus(404);
+  fs.stat(voicedMp3File, (err, stats) => {
+    if (err) {
+      return res.status(404).json({ error: 'Audio file not ready' });
+    }
 
-    res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': stats.size });
-    const readStream = fs.createReadStream(voicedFile);
+    if (stats.size === 0) {
+      return res.status(500).json({ error: 'Audio file is empty' });
+    }
+
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Length', stats.size);
+
+    const readStream = fs.createReadStream(voicedMp3File);
+    readStream.on('error', () => {
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error reading audio file' });
+      }
+    });
+
     readStream.pipe(res);
   });
 });
 
-// Test endpoints
+app.get('/broadcastAudioMp3', (req, res) => {
+  fs.stat(voicedMp3File, (err, stats) => {
+    if (err) {
+      return res.status(404).json({ error: 'MP3 file not ready' });
+    }
+
+    if (stats.size === 0) {
+      return res.status(500).json({ error: 'MP3 file is empty' });
+    }
+
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Length', stats.size);
+
+    const readStream = fs.createReadStream(voicedMp3File);
+    readStream.on('error', () => {
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error reading MP3 file' });
+      }
+    });
+
+    readStream.pipe(res);
+  });
+});
+
 app.get('/test-audio', (req, res) => {
   res.sendFile(recordFile);
 });
 
 app.get('/test-response', (req, res) => {
-  res.sendFile(voicedFile);
+  res.sendFile(voicedMp3File);
+});
+
+app.get('/test-response-mp3', (req, res) => {
+  res.sendFile(voicedMp3File);
 });
 
 app.get('/status', (req, res) => {
   res.json({
     recordingExists: fs.existsSync(recordFile),
-    responseExists: fs.existsSync(voicedFile),
+    responseExists: fs.existsSync(voicedMp3File),
     responseReady: shouldDownloadFile,
-    googleCredentials: !!process.env.GOOGLE_APPLICATION_CREDENTIALS,
-    groqKeyConfigured: !!groqApiKey
+    groqKeyConfigured: !!groqApiKey,
+    audioServiceProvider: 'Groq (Whisper + LLM) + Murf (TTS)',
+    ngrokUrl,
   });
 });
 
-// Start Server
+app.get('/debug-audio', (req, res) => {
+  fs.stat(voicedMp3File, (err, stats) => {
+    if (err) {
+      return res.json({ error: 'Audio file not found', file: voicedMp3File });
+    }
+
+    const buffer = Buffer.alloc(100);
+    const fd = fs.openSync(voicedMp3File, 'r');
+    fs.readSync(fd, buffer, 0, 100);
+    fs.closeSync(fd);
+
+    res.json({
+      fileSize: stats.size,
+      firstBytesHex: buffer.slice(0, 16).toString('hex'),
+      mp3Signature: buffer.slice(0, 3).toString('ascii'),
+      status: buffer.slice(0, 3).toString('ascii') === 'ID3' ? 'Likely MP3 (ID3)' : 'MP3 header not ID3 (could still be valid MPEG frame)',
+    });
+  });
+});
+
+app.get('/list-voices', async (req, res) => {
+  const voices = groqAudioService.getSupportedVoices();
+  res.json({
+    success: true,
+    voices,
+    currentVoice: groqAudioService.getVoiceId(),
+  });
+});
+
+app.post('/chat', async (req, res) => {
+  const userMessage = (req.body?.message || '').trim();
+  if (!userMessage) {
+    return res.status(400).json({ success: false, error: 'Message is required.' });
+  }
+
+  const assistantResponse = await generateGroqResponse(userMessage);
+
+  try {
+    const chunkBuffers = await groqAudioService.textToSpeechChunks(assistantResponse);
+    const audioDataUrls = chunkBuffers.map((buffer) => `data:audio/mpeg;base64,${buffer.toString('base64')}`);
+
+    // Keep writing one file for compatibility/debug endpoints.
+    fs.writeFileSync(voicedMp3File, chunkBuffers[0]);
+
+    const tag = detectTag(`${userMessage} ${assistantResponse}`);
+    const entry = {
+      id: `${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+      createdAt: new Date().toISOString(),
+      userMessage,
+      aiResponse: assistantResponse,
+      tag,
+      audioDataUrl: audioDataUrls[0] || '',
+      audioDataUrls,
+    };
+
+    journalEntries = [entry, ...journalEntries].slice(0, 200);
+    return res.json({ success: true, ...entry });
+  } catch (error) {
+    console.error('Error in chat TTS:', error.message);
+    const tag = detectTag(`${userMessage} ${assistantResponse}`);
+    const entry = {
+      id: `${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+      createdAt: new Date().toISOString(),
+      userMessage,
+      aiResponse: assistantResponse,
+      tag,
+      audioDataUrl: '',
+    };
+    journalEntries = [entry, ...journalEntries].slice(0, 200);
+    return res.json({ success: true, ...entry, warning: 'Audio generation failed' });
+  }
+});
+
+app.get('/settings', (req, res) => {
+  res.json({
+    success: true,
+    voiceId: groqAudioService.getVoiceId(),
+    voiceSettings: groqAudioService.getVoiceSettings(),
+    audioProvider: 'Groq (Whisper + LLM) + Murf (TTS)',
+    backendUrl: process.env.BACKEND_URL || `http://localhost:${port}`,
+    ngrokUrl,
+  });
+});
+
+app.put('/settings/voice', (req, res) => {
+  const voiceId = (req.body?.voiceId || '').trim();
+  const allowedVoiceIds = groqAudioService.getSupportedVoices().map((v) => v.id);
+
+  if (!allowedVoiceIds.includes(voiceId)) {
+    return res.status(400).json({
+      success: false,
+      error: `voiceId must be one of: ${allowedVoiceIds.join(', ')}`,
+    });
+  }
+
+  groqAudioService.setVoiceSettings({ voice: voiceId });
+  return res.json({ success: true, voiceId: groqAudioService.getVoiceId() });
+});
+
+app.put('/settings/voice-config', (req, res) => {
+  const speed = Number(req.body?.speed);
+
+  if (!Number.isFinite(speed) || speed < 0.5 || speed > 2.0) {
+    return res.status(400).json({
+      success: false,
+      error: 'speed must be a number between 0.5 and 2.0.',
+    });
+  }
+
+  groqAudioService.setVoiceSettings({ speed });
+  return res.json({ success: true, voiceSettings: groqAudioService.getVoiceSettings() });
+});
+
+app.post('/settings/preview', async (req, res) => {
+  const previewText = (req.body?.text || 'Hello, I am MindEase. Take a deep breath. You are not alone.').trim();
+
+  try {
+    const chunkBuffers = await groqAudioService.textToSpeechChunks(previewText);
+    const audioDataUrls = chunkBuffers.map((buffer) => `data:audio/mpeg;base64,${buffer.toString('base64')}`);
+    return res.json({
+      success: true,
+      audioDataUrl: audioDataUrls[0] || '',
+      audioDataUrls,
+    });
+  } catch (error) {
+    console.error('Error in preview TTS:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to generate preview audio' });
+  }
+});
+
+app.get('/journal', (req, res) => {
+  res.json({ success: true, entries: journalEntries });
+});
+
+app.post('/journal', (req, res) => {
+  const body = req.body || {};
+  const entry = {
+    id: body.id || `${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+    createdAt: body.createdAt || new Date().toISOString(),
+    userMessage: body.userMessage || '',
+    aiResponse: body.aiResponse || '',
+    tag: body.tag || detectTag(`${body.userMessage || ''} ${body.aiResponse || ''}`),
+    audioDataUrl: body.audioDataUrl || '',
+  };
+
+  journalEntries = [entry, ...journalEntries].slice(0, 300);
+  res.json({ success: true, entry });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ success: true, message: 'MindEase backend is running.' });
+});
+
+app.use((err, req, res, next) => {
+  console.error('Unhandled API error:', err);
+  res.status(500).json({ success: false, error: 'Internal server error.' });
+});
+
 app.listen(port, () => {
   console.log(`Server running at http://localhost:${port}/`);
-  //printing the ip 
   const interfaces = require('os').networkInterfaces();
   for (const interfaceName in interfaces) {
     const addresses = interfaces[interfaceName];
@@ -129,162 +338,83 @@ app.listen(port, () => {
   }
 });
 
-// Speech to Text using Google
 async function speechToTextAPI() {
   try {
-    // Check if file exists
     if (!fs.existsSync(recordFile)) {
       throw new Error('Audio file not found');
     }
 
-    // Read audio file and convert to base64
-    const fileContent = fs.readFileSync(recordFile);
-    console.log('Audio File Size:', fileContent.length);
-
-    if (!fileContent || fileContent.length === 0) {
-      throw new Error('Audio file is empty');
+    const transcription = await groqAudioService.transcribeAudio(recordFile);
+    if (!transcription) {
+      throw new Error('Transcription returned empty result');
     }
 
-    const audio = {
-      content: fileContent.toString('base64'),
-    };
-
-    const config = {
-      encoding: 'LINEAR16',
-      sampleRateHertz: 16000,  // Match ESP32 recording rate
-      languageCode: 'en-US',
-    };
-
-    const request = {
-      audio: audio,
-      config: config,
-    };
-
-    // Call Google Speech-to-Text API
-    const [response] = await speechClient.recognize(request);
-
-    const transcription = response.results.map(result => result.alternatives[0].transcript).join('\n');
-    console.log('Transcription:', transcription);
     return transcription;
   } catch (error) {
-    console.error('Error in speechToTextAPI:', error);
+    console.error('Error in speechToTextAPI:', error.message);
     return null;
   }
 }
 
-// Call Groq API
-async function callGroq(text) {
+async function callGroqForEsp32(text) {
+  const responseText = await generateGroqResponse(text);
   try {
-    console.log('Sending to Groq:', text);
+    await groqAudioService.textToSpeech(responseText, voicedMp3File);
+    shouldDownloadFile = true;
+  } catch (error) {
+    shouldDownloadFile = false;
+    console.error('Error generating ESP32 voice response:', error.message);
+  }
+}
 
-    const apiUrl = "https://api.groq.com/openai/v1/chat/completions";
+async function generateGroqResponse(text) {
+  try {
+    if (!text || text.trim() === '' || text.toLowerCase().includes('static') || text.length < 3) {
+      return "I couldn't hear you clearly. Could you try again, maybe a little slower?";
+    }
 
+    const apiUrl = 'https://api.groq.com/openai/v1/chat/completions';
     const response = await axios.post(
       apiUrl,
       {
         messages: [
           {
-            role: "user",
-            content: text
-          }
+            role: 'system',
+            content: MENTAL_HEALTH_SYSTEM_PROMPT,
+          },
+          {
+            role: 'user',
+            content: text,
+          },
         ],
-        model: "llama-3.3-70b-versatile",
-        temperature: 1,
-        max_tokens: 150,
+        model: 'llama-3.3-70b-versatile',
+        temperature: 0.8,
+        max_tokens: 320,
         top_p: 1,
         stream: false,
-        stop: null
       },
       {
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
-        }
+          Authorization: `Bearer ${groqApiKey}`,
+        },
       }
     );
 
-    // Extract the AI response
-    const groqResponse = response.data.choices[0].message.content;
-    console.log('Groq Response:', groqResponse);
-
-    // Convert response to speech
-    await GptResponsetoSpeech(groqResponse);
-
+    return response?.data?.choices?.[0]?.message?.content || 'I am here with you. Would you like to share a little more?';
   } catch (error) {
-    console.error('Error calling Groq API:');
-    if (error.response) {
-      console.error('Response status:', error.response.status);
-      console.error('Response data:', error.response.data);
-    } else {
-      console.error(error.message);
-    }
-
-    // Send a fallback response in case of error
-    const fallbackResponse = "I'm sorry, I couldn't process your request at this time.";
-    await GptResponsetoSpeech(fallbackResponse);
+    console.error('Error in Groq API:', error.message);
+    return "I'm here with you. I'm having a small connection issue right now, but we can keep going together.";
   }
 }
 
-//calling custom llm api which is in google colab 
-// Call custom local LLM API instead of Groq
-async function callCustomLLM(text) {
-  try {
-    console.log('Sending to custom LLM:', text);
-
-    const apiUrl = "https://nicely-funky-katydid.ngrok-free.app/generate";
-
-    const response = await axios.post(
-      apiUrl,
-      { prompt: text },
-      {
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    // Extract the string response from the object
-    const customResponse = response.data.response; // Access the 'response' property
-    console.log('Custom LLM Response:', response.data);
-
-    // Convert response to speech
-    await GptResponsetoSpeech(customResponse);
-  } catch (error) {
-    console.error('Error calling custom LLM API:', error.message);
-    const fallbackResponse = "I'm sorry, I couldn't process your request at this time.";
-    await GptResponsetoSpeech(fallbackResponse);
-  }
-}
-
-
-// Text to Speech using Google
-// In the server.js file:
-async function GptResponsetoSpeech(gptResponse) {
-  try {
-    // Ensure we have a valid response
-    if (!gptResponse || gptResponse.trim() === '') {
-      gptResponse = "I'm sorry, I don't have a response at this time.";
-    }
-
-    const request = {
-      input: { text: gptResponse },
-      voice: { languageCode: 'en-US', ssmlGender: 'NEUTRAL' },
-      audioConfig: {
-        audioEncoding: 'LINEAR16',
-        sampleRateHertz: 16000,  // Make sure this matches ESP32
-        effectsProfileId: ['headphone-class-device'],
-        pitch: 0.0,
-        speakingRate: 1.0,
-        audioChannelCount: 1
-      },
-    };
-
-    const [response] = await ttsClient.synthesizeSpeech(request);
-    fs.writeFileSync(voicedFile, response.audioContent, 'binary');
-    shouldDownloadFile = true;
-    console.log("TTS conversion complete, response ready for playback");
-  } catch (error) {
-    console.error('Error in Text-to-Speech conversion:', error);
-    shouldDownloadFile = false;
-  }
+function detectTag(text) {
+  const normalized = text.toLowerCase();
+  if (normalized.includes('anxious') || normalized.includes('anxiety') || normalized.includes('panic')) return 'Anxiety';
+  if (normalized.includes('stress') || normalized.includes('pressure') || normalized.includes('overwhelmed')) return 'Stress';
+  if (normalized.includes('sleep') || normalized.includes('insomnia') || normalized.includes('night')) return 'Sleep';
+  if (normalized.includes('sad') || normalized.includes('hopeless') || normalized.includes('down')) return 'Sadness';
+  if (normalized.includes('motivation') || normalized.includes('goal') || normalized.includes('focus')) return 'Motivation';
+  if (normalized.includes('happy') || normalized.includes('grateful') || normalized.includes('excited')) return 'Happy';
+  return 'Stress';
 }
