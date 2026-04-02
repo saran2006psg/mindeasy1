@@ -1,7 +1,9 @@
-import { Play, Volume2 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { Play, Square, Volume2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { audioManager } from '../services/audioManager';
 
 interface MessageBubbleProps {
+  id: string;
   role: 'user' | 'assistant';
   text: string;
   timeText: string;
@@ -9,113 +11,39 @@ interface MessageBubbleProps {
   audioDataUrls?: string[];
 }
 
-let activeAudioPlayer: HTMLAudioElement | null = null;
-
-function createPlayableAudio(audioDataUrl: string) {
-  if (!audioDataUrl.startsWith('data:')) {
-    return { audio: new Audio(audioDataUrl), objectUrl: '' };
-  }
-
-  const firstComma = audioDataUrl.indexOf(',');
-  if (firstComma === -1) {
-    return { audio: new Audio(audioDataUrl), objectUrl: '' };
-  }
-
-  const meta = audioDataUrl.slice(5, firstComma);
-  const base64 = audioDataUrl.slice(firstComma + 1);
-  const mimeType = (meta.split(';')[0] || 'audio/wav').trim();
-
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-
-  const blob = new Blob([bytes], { type: mimeType });
-  const objectUrl = URL.createObjectURL(blob);
-  return { audio: new Audio(objectUrl), objectUrl };
-}
-
-export function MessageBubble({ role, text, timeText, audioDataUrl, audioDataUrls }: MessageBubbleProps) {
+export function MessageBubble({ id, role, text, timeText, audioDataUrl, audioDataUrls }: MessageBubbleProps) {
   const isUser = role === 'user';
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const audioObjectUrlRef = useRef<string>('');
   const [isPlaying, setIsPlaying] = useState(false);
 
   useEffect(() => {
+    // Check if this specific bubble is currently playing globally
+    const checkStatus = setInterval(() => {
+      const activeId = audioManager.getActiveId();
+      setIsPlaying(activeId === id);
+    }, 100);
+
     return () => {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current.currentTime = 0;
-        if (activeAudioPlayer === audioRef.current) {
-          activeAudioPlayer = null;
-        }
-      }
-      if (audioObjectUrlRef.current) {
-        URL.revokeObjectURL(audioObjectUrlRef.current);
-        audioObjectUrlRef.current = '';
+      clearInterval(checkStatus);
+      if (audioManager.getActiveId() === id) {
+        audioManager.stop();
       }
     };
-  }, []);
+  }, [id]);
 
-  const playAudio = () => {
-    const sequence = audioDataUrls?.length ? audioDataUrls : (audioDataUrl ? [audioDataUrl] : []);
-    if (!sequence.length) {
-      return;
-    }
-
-    if (audioRef.current && !audioRef.current.paused) {
-      return;
-    }
-
-    if (activeAudioPlayer && !activeAudioPlayer.paused) {
-      activeAudioPlayer.pause();
-      activeAudioPlayer.currentTime = 0;
-    }
-
-    if (audioObjectUrlRef.current) {
-      URL.revokeObjectURL(audioObjectUrlRef.current);
-      audioObjectUrlRef.current = '';
-    }
-
-    let index = 0;
-
-    const finishPlayback = () => {
+  const toggleAudio = () => {
+    if (isPlaying) {
+      audioManager.stop();
       setIsPlaying(false);
-      if (audioObjectUrlRef.current) {
-        URL.revokeObjectURL(audioObjectUrlRef.current);
-        audioObjectUrlRef.current = '';
-      }
-      if (activeAudioPlayer === audioRef.current) {
-        activeAudioPlayer = null;
-      }
-    };
+      return;
+    }
 
-    const playNext = () => {
-      if (audioObjectUrlRef.current) {
-        URL.revokeObjectURL(audioObjectUrlRef.current);
-        audioObjectUrlRef.current = '';
-      }
+    const sequence = audioDataUrls?.length ? audioDataUrls : (audioDataUrl ? [audioDataUrl] : []);
+    if (!sequence.length) return;
 
-      if (index >= sequence.length) {
-        finishPlayback();
-        return;
-      }
-
-      const { audio, objectUrl } = createPlayableAudio(sequence[index]);
-      audioRef.current = audio;
-      audioObjectUrlRef.current = objectUrl;
-      activeAudioPlayer = audio;
-      setIsPlaying(true);
-      index += 1;
-
-      audio.onended = playNext;
-      audio.onerror = finishPlayback;
-
-      void audio.play().catch(finishPlayback);
-    };
-
-    playNext();
+    audioManager.play(sequence, id, () => {
+      setIsPlaying(false);
+    });
+    setIsPlaying(true);
   };
 
   return (
@@ -134,13 +62,16 @@ export function MessageBubble({ role, text, timeText, audioDataUrl, audioDataUrl
           {!isUser && audioDataUrl && (
             <button
               type="button"
-              onClick={playAudio}
-              disabled={isPlaying}
-              className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-1 text-emerald-700 hover:bg-emerald-200"
+              onClick={toggleAudio}
+              className={`inline-flex items-center gap-1 rounded-full px-2 py-1 transition ${
+                isPlaying 
+                  ? 'bg-red-100 text-red-700 hover:bg-red-200 shadow-sm' 
+                  : 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200'
+              }`}
             >
-              <Play size={12} />
+              {isPlaying ? <Square size={12} fill="currentColor" /> : <Play size={12} fill="currentColor" />}
               <Volume2 size={12} />
-              {isPlaying ? 'Playing' : 'Play'}
+              {isPlaying ? 'Stop' : 'Play'}
             </button>
           )}
         </div>

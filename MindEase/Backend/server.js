@@ -1,13 +1,23 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const elevenlabsService = require('./services/elevenlabsService'); // Switched to ElevenLabs
-require('dotenv').config();
 require('express-async-errors');
 
+const mongoose = require('mongoose');
+const JournalEntry = require('./models/JournalEntry');
+
 const port = process.env.PORT || 3000;
+
+// Connect to MongoDB
+const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/mindease';
+mongoose.connect(mongoUri)
+  .then(() => console.log('✅ Connected to MongoDB'))
+  .catch(err => console.error('❌ MongoDB connection error:', err));
+
 const app = express();
 
 const recordFile = path.join(__dirname, 'tmp', 'recording.wav');
@@ -26,9 +36,23 @@ const MENTAL_HEALTH_SYSTEM_PROMPT =
 let shouldDownloadFile = false;
 let journalEntries = [];
 
+// Load mock journal data if it exists (for demo sync)
+try {
+  const mockJournalFile = path.join(__dirname, 'mock', 'journal.json');
+  if (fs.existsSync(mockJournalFile)) {
+    const mockData = JSON.parse(fs.readFileSync(mockJournalFile, 'utf8'));
+    journalEntries = [...mockData];
+    console.log(`✅ Loaded ${mockData.length} mock entries for software demo sync.`);
+  }
+} catch (error) {
+  console.error('Error loading mock journal data:', error.message);
+}
+
 app.use(cors());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: '50mb' }));
+app.use('/mock', express.static(path.join(__dirname, 'mock')));
+app.use('/public', express.static(path.join(__dirname, 'public')));
 
 app.post('/uploadAudio', async (req, res) => {
   try {
@@ -210,35 +234,41 @@ app.post('/chat', async (req, res) => {
     const chunkBuffers = await elevenlabsService.textToSpeechChunks(assistantResponse);
     const audioDataUrls = chunkBuffers.map((buffer) => `data:audio/mpeg;base64,${buffer.toString('base64')}`);
 
-    // Keep writing one file for compatibility/debug endpoints.
-    fs.writeFileSync(voicedMp3File, chunkBuffers[0]);
-
+    // Create entry
     const tag = detectTag(`${userMessage} ${assistantResponse}`);
-    const entry = {
+    const moodScore = await calculateMoodScore(userMessage, assistantResponse);
+    
+    const entry = new JournalEntry({
       id: `${Date.now()}-${Math.floor(Math.random() * 10000)}`,
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(),
       userMessage,
       aiResponse: assistantResponse,
       tag,
-      audioDataUrl: audioDataUrls[0] || '',
+      moodScore,
       audioDataUrls,
-    };
+      audioDataUrl: audioDataUrls[0] || '',
+    });
 
-    journalEntries = [entry, ...journalEntries].slice(0, 200);
-    return res.json({ success: true, ...entry });
+    await entry.save();
+    console.log('✅ Journal entry saved to MongoDB (Chat)');
+
+    return res.json({ success: true, ...entry.toObject() });
   } catch (error) {
-    console.error('Error in chat TTS:', error.message);
+    console.error('Error in chat processing:', error.message);
     const tag = detectTag(`${userMessage} ${assistantResponse}`);
-    const entry = {
+    
+    const entry = new JournalEntry({
       id: `${Date.now()}-${Math.floor(Math.random() * 10000)}`,
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(),
       userMessage,
       aiResponse: assistantResponse,
       tag,
-      audioDataUrl: '',
-    };
-    journalEntries = [entry, ...journalEntries].slice(0, 200);
-    return res.json({ success: true, ...entry, warning: 'Audio generation failed' });
+      moodScore: 5,
+    });
+    
+    await entry.save().catch(e => console.error('Failed to save fallback entry:', e));
+
+    return res.json({ success: true, ...entry.toObject(), warning: 'Audio generation failed' });
   }
 });
 
@@ -272,40 +302,88 @@ app.put('/settings/voice-config', (req, res) => {
   return res.json({ success: true, voiceSettings: elevenlabsService.getVoiceSettings() });
 });
 
+const ttsCache = new Map();
+
 app.post('/settings/preview', async (req, res) => {
   const previewText = (req.body?.text || 'Hello, I am MindEase. Take a deep breath. You are not alone.').trim();
+
+  if (ttsCache.has(previewText)) {
+    return res.json(ttsCache.get(previewText));
+  }
 
   try {
     const chunkBuffers = await elevenlabsService.textToSpeechChunks(previewText);
     const audioDataUrls = chunkBuffers.map((buffer) => `data:audio/mpeg;base64,${buffer.toString('base64')}`);
-    return res.json({
+    
+    const result = {
       success: true,
       audioDataUrl: audioDataUrls[0] || '',
       audioDataUrls,
-    });
+    };
+
+    ttsCache.set(previewText, result);
+    return res.json(result);
   } catch (error) {
     console.error('Error in preview TTS:', error.message);
     return res.status(500).json({ success: false, error: 'Failed to generate preview audio' });
   }
 });
 
-app.get('/journal', (req, res) => {
-  res.json({ success: true, entries: journalEntries });
+app.get('/journal', async (req, res) => {
+  try {
+    const entries = await JournalEntry.find().sort({ createdAt: -1 }).limit(100);
+    res.json({ success: true, entries });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to fetch journal entries' });
+  }
 });
 
-app.post('/journal', (req, res) => {
-  const body = req.body || {};
-  const entry = {
-    id: body.id || `${Date.now()}-${Math.floor(Math.random() * 10000)}`,
-    createdAt: body.createdAt || new Date().toISOString(),
-    userMessage: body.userMessage || '',
-    aiResponse: body.aiResponse || '',
-    tag: body.tag || detectTag(`${body.userMessage || ''} ${body.aiResponse || ''}`),
-    audioDataUrl: body.audioDataUrl || '',
-  };
+app.post('/journal', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const entry = new JournalEntry({
+      id: body.id || `${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+      createdAt: body.createdAt || new Date(),
+      userMessage: body.userMessage || '',
+      aiResponse: body.aiResponse || '',
+      tag: body.tag || detectTag(`${body.userMessage || ''} ${body.aiResponse || ''}`),
+      moodScore: body.moodScore || 5,
+      audioDataUrl: body.audioDataUrl || '',
+    });
 
-  journalEntries = [entry, ...journalEntries].slice(0, 300);
-  res.json({ success: true, entry });
+    await entry.save();
+    res.json({ success: true, entry });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to save manual journal entry' });
+  }
+});
+
+app.get('/analytics', async (req, res) => {
+  try {
+    const entries = await JournalEntry.find().sort({ createdAt: 1 });
+    
+    // Format mood data for charts
+    const moodTrend = entries.map(e => ({
+      date: e.createdAt.toISOString().split('T')[0],
+      score: e.moodScore
+    }));
+
+    // Aggregate tags
+    const tagCounts = {};
+    entries.forEach(e => {
+      tagCounts[e.tag] = (tagCounts[e.tag] || 0) + 1;
+    });
+
+    res.json({
+      success: true,
+      moodTrend,
+      tagDistribution: Object.entries(tagCounts).map(([name, value]) => ({ name, value })),
+      totalEntries: entries.length,
+      averageMood: entries.length > 0 ? (entries.reduce((acc, curr) => acc + curr.moodScore, 0) / entries.length).toFixed(1) : 0
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to fetch analytics' });
+  }
 });
 
 app.get('/health', (req, res) => {
@@ -347,11 +425,60 @@ async function speechToTextAPI() {
 async function callElevenLabsForEsp32(text) {
   const responseText = await generateGroqResponse(text);
   try {
+    // Generate voice for hardware
     await elevenlabsService.textToSpeech(responseText, voicedMp3File);
     shouldDownloadFile = true;
+
+    // CAPTURE DATA FROM HARDWARE
+    const tag = detectTag(`${text} ${responseText}`);
+    const moodScore = await calculateMoodScore(text, responseText);
+    
+    const entry = new JournalEntry({
+      id: `hw-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+      createdAt: new Date(),
+      userMessage: text,
+      aiResponse: responseText,
+      tag,
+      moodScore,
+    });
+    
+    await entry.save();
+    console.log('✅ Hardware conversation captured in MongoDB');
   } catch (error) {
     shouldDownloadFile = false;
-    console.error('Error generating ESP32 voice response:', error.message);
+    console.error('Error processing hardware conversation:', error.message);
+  }
+}
+
+async function calculateMoodScore(userText, aiText) {
+  try {
+    const prompt = `Analyze the sentiment of this user message: "${userText}". 
+    The AI responded with: "${aiText}".
+    On a scale of 1 to 10 (1 being extremely distressed/sad, 10 being extremely happy/positive), what is the user's mood?
+    Respond with ONLY a single number.`;
+
+    const response = await axios.post(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        messages: [{ role: 'user', content: prompt }],
+        model: 'llama-3.3-70b-versatile',
+        temperature: 0.3,
+        max_tokens: 5,
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        },
+      }
+    );
+
+    const scoreStr = response?.data?.choices?.[0]?.message?.content?.trim();
+    const score = parseInt(scoreStr);
+    return isNaN(score) ? 5 : Math.max(1, Math.min(10, score));
+  } catch (error) {
+    console.warn('Mood scoring failed, defaulting to 5');
+    return 5;
   }
 }
 

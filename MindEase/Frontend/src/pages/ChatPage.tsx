@@ -1,36 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Square } from 'lucide-react';
 import { ChatComposer } from '../components/ChatComposer';
 import { MessageBubble } from '../components/MessageBubble';
 import { QuickHelpCards } from '../components/QuickHelpCards';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 import { api } from '../services/api';
 import { store } from '../store/mindeaseStore';
+import { audioManager } from '../services/audioManager';
 import type { ConversationEntry } from '../types';
-
-function createPlayableAudio(audioDataUrl: string) {
-  if (!audioDataUrl.startsWith('data:')) {
-    return { audio: new Audio(audioDataUrl), objectUrl: '' };
-  }
-
-  const firstComma = audioDataUrl.indexOf(',');
-  if (firstComma === -1) {
-    return { audio: new Audio(audioDataUrl), objectUrl: '' };
-  }
-
-  const meta = audioDataUrl.slice(5, firstComma);
-  const base64 = audioDataUrl.slice(firstComma + 1);
-  const mimeType = (meta.split(';')[0] || 'audio/wav').trim();
-
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-
-  const blob = new Blob([bytes], { type: mimeType });
-  const objectUrl = URL.createObjectURL(blob);
-  return { audio: new Audio(objectUrl), objectUrl };
-}
 
 export function ChatPage() {
   const [conversations, setConversations] = useState<ConversationEntry[]>(store.getConversations());
@@ -39,6 +16,7 @@ export function ChatPage() {
   const [error, setError] = useState('');
   const [recordingError, setRecordingError] = useState('');
   const [isRecordingFallback, setIsRecordingFallback] = useState(false);
+  const [activeAudioId, setActiveAudioId] = useState<string | null>(null);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -52,6 +30,15 @@ export function ChatPage() {
   // Load conversations from store when component mounts or tab is switched back
   useEffect(() => {
     setConversations(store.getConversations());
+    
+    const interval = setInterval(() => {
+      setActiveAudioId(audioManager.getActiveId());
+    }, 100);
+
+    return () => {
+      clearInterval(interval);
+      audioManager.stop();
+    };
   }, []);
 
   const canUseRecorderFallback = typeof window !== 'undefined' && !!window.MediaRecorder;
@@ -160,14 +147,16 @@ export function ChatPage() {
     store.setConversations([]);
     setInput('');
     setError('');
+    audioManager.stop();
   };
 
   const messages = useMemo(() => {
-    const list: Array<{ role: 'user' | 'assistant'; text: string; timeText: string; audioDataUrl?: string; audioDataUrls?: string[] }> = [];
+    const list: Array<{ id: string; role: 'user' | 'assistant'; text: string; timeText: string; audioDataUrl?: string; audioDataUrls?: string[] }> = [];
     [...conversations].reverse().forEach((entry) => {
       const timeText = new Date(entry.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      list.push({ role: 'user', text: entry.userMessage, timeText });
+      list.push({ id: `user-${entry.id}`, role: 'user', text: entry.userMessage, timeText });
       list.push({
+        id: entry.id,
         role: 'assistant',
         text: entry.aiResponse,
         timeText,
@@ -205,29 +194,9 @@ export function ChatPage() {
       const sequence = entry.audioDataUrls?.length
         ? entry.audioDataUrls
         : (entry.audioDataUrl ? [entry.audioDataUrl] : []);
+      
       if (sequence.length) {
-        let index = 0;
-        let lastObjectUrl = '';
-
-        const playNext = () => {
-          if (lastObjectUrl) {
-            URL.revokeObjectURL(lastObjectUrl);
-            lastObjectUrl = '';
-          }
-
-          if (index >= sequence.length) {
-            return;
-          }
-
-          const { audio, objectUrl } = createPlayableAudio(sequence[index]);
-          lastObjectUrl = objectUrl;
-          index += 1;
-          audio.onended = playNext;
-          audio.onerror = playNext;
-          void audio.play().catch(playNext);
-        };
-
-        playNext();
+        audioManager.play(sequence, entry.id);
       }
     } catch {
       setError('Could not reach backend. Verify your backend URL in Settings and try again.');
@@ -267,6 +236,7 @@ export function ChatPage() {
         {messages.map((message, idx) => (
           <MessageBubble
             key={`${message.role}-${idx}`}
+            id={message.id}
             role={message.role}
             text={message.text}
             timeText={message.timeText}
@@ -276,9 +246,22 @@ export function ChatPage() {
         ))}
 
         {isSending && (
-          <div className="text-sm text-slate-500">MindEase is thinking and preparing a voice response...</div>
+          <div className="text-sm text-slate-500 italic animate-pulse">MindEase is thinking and preparing a voice response...</div>
         )}
       </div>
+
+      {activeAudioId && (
+        <div className="flex justify-center">
+          <button
+            type="button"
+            onClick={() => audioManager.stop()}
+            className="flex items-center gap-2 rounded-full bg-rose-100 px-6 py-2 text-sm font-bold text-rose-700 shadow-lg hover:bg-rose-200 transition-all transform hover:scale-105 active:scale-95"
+          >
+            <Square size={16} fill="currentColor" />
+            Stop AI Voice
+          </button>
+        </div>
+      )}
 
       <ChatComposer
         input={input}
