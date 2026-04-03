@@ -70,4 +70,9 @@ export const api = {
   async saveJournal(entry: ConversationEntry) {
     await client().post('/journal', entry);
   },
+
+  async fetchAnalytics() {
+    const { data } = await client().get('/analytics');
+    return data;
+  },
 };

@@ -6,6 +6,7 @@ export interface ConversationEntry {
   userMessage: string;
   aiResponse: string;
   tag: Tag;
+  moodScore?: number;
   audioDataUrl?: string;
   audioDataUrls?: string[];
 }
@@ -37,6 +38,7 @@ export interface ChatResponse {
   userMessage: string;
   aiResponse: string;
   tag: Tag;
+  moodScore?: number;
   audioDataUrl?: string;
   audioDataUrls?: string[];
 }

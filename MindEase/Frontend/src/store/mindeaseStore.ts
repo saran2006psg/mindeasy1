@@ -8,7 +8,8 @@ const defaultSettings: AppSettings = {
   backendUrl: 'http://localhost:3000',
   ngrokUrl: '',
   voiceId: 'troy',
-  speed: 1,
+  stability: 0.5,
+  similarityBoost: 0.75,
 };
 
 export const store = {
@@ -42,5 +43,21 @@ export const store = {
   setSettings(settings: AppSettings) {
     localStorage.setItem(settingsKey, JSON.stringify(settings));
     localStorage.setItem(backendUrlKey, settings.backendUrl);
+  },
+
+  isLoggedIn(): boolean {
+    return localStorage.getItem('mindease_auth') === 'true';
+  },
+
+  login(username: string, password: string): boolean {
+    if (username === 'surya' && password === 'surya123') {
+      localStorage.setItem('mindease_auth', 'true');
+      return true;
+    }
+    return false;
+  },
+
+  logout() {
+    localStorage.removeItem('mindease_auth');
   },
 };
